@@ -1,3 +1,4 @@
+
 """
 Twilio WhatsApp bot backend (Flask)
 - Uses MongoDB for sessions, cache, videos, tasks
@@ -30,6 +31,7 @@ load_dotenv()
 try:
     import cloudinary
     import cloudinary.uploader
+    import cloudinary.api
 except Exception:
     cloudinary = None
 
@@ -68,7 +70,8 @@ if not MONGODB_URI:
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM")
-PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL")
+# normalize PUBLIC_BASE_URL (strip trailing slash if present)
+PUBLIC_BASE_URL = (os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/") or None
 
 REPLICATE_API_TOKEN = os.environ.get("REPLICATE_API_TOKEN")
 REPLICATE_MODEL = os.environ.get("REPLICATE_MODEL", "minimax/video-01")
@@ -84,11 +87,21 @@ CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET")
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
 WHATSAPP_MAX_BYTES = 16 * 1024 * 1024 - 2000
 
+# Small defaults for Replicate (if used)
+FAST_DEFAULTS: Dict[str, Any] = {
+    "duration": 5, "fps": 12, "width": 512, "height": 288, "steps": 20, "samples": 1, "guidance_scale": 6
+}
+
 # --- Logging ---
 LOG_DIR = ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 logging.basicConfig(filename=str(LOG_DIR / "server.log"), level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
+# console logging too
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+console.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logging.getLogger("").addHandler(console)
 
 # --- Flask ---
 app = Flask(__name__)
@@ -109,10 +122,14 @@ try:
 except Exception:
     logging.exception("Index creation failed")
 
-# --- Twilio ---
+# --- Twilio client (if available) ---
 twilio_client = None
 if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TwilioClient:
-    twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    try:
+        twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        logging.info("Twilio client created")
+    except Exception:
+        logging.exception("Failed to init Twilio client")
 
 # --- Helper functions ---
 from bson import ObjectId
@@ -132,7 +149,9 @@ def _normalize_prompt(p: str) -> str:
     return " ".join(p.strip().lower().split())
 
 def save_cache(prompt_norm: str, file_path: str, meta: dict = None):
-    cache_col.update_one({"prompt_norm": prompt_norm}, {"$set": {"file_path": file_path, "meta": meta or {}, "updated_at": datetime.now(timezone.utc)}}, upsert=True)
+    cache_col.update_one({"prompt_norm": prompt_norm},
+                         {"$set": {"file_path": file_path, "meta": meta or {}, "updated_at": datetime.now(timezone.utc)}},
+                         upsert=True)
 
 def load_cache(prompt_norm: str) -> Optional[str]:
     r = cache_col.find_one({"prompt_norm": prompt_norm})
@@ -156,43 +175,79 @@ def record_video(filename: str, path: str, prompt: str, session_id: Optional[str
         doc["cloud_url"] = cloud_url
     videos_col.insert_one(doc)
 
-# --- Cloudinary ---
-if cloudinary:
+# --- Cloudinary configuration & upload ---
+def _configure_cloudinary() -> bool:
+    if cloudinary is None:
+        logging.warning("Cloudinary SDK not installed")
+        return False
     try:
         if CLOUDINARY_URL:
             cloudinary.config(cloudinary_url=CLOUDINARY_URL)
+            logging.info("Cloudinary configured via CLOUDINARY_URL")
+        elif CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
+            cloudinary.config(cloud_name=CLOUDINARY_CLOUD_NAME,
+                              api_key=CLOUDINARY_API_KEY,
+                              api_secret=CLOUDINARY_API_SECRET,
+                              secure=True)
+            logging.info("Cloudinary configured via individual credentials")
         else:
-            cloudinary.config(
-                cloud_name=CLOUDINARY_CLOUD_NAME or None,
-                api_key=CLOUDINARY_API_KEY or None,
-                api_secret=CLOUDINARY_API_SECRET or None,
-                secure=True
-            )
+            logging.warning("Cloudinary credentials missing")
+            return False
+        # try a tiny ping (if API available) to confirm credentials
+        try:
+            ping = cloudinary.api.ping()
+            logging.info("Cloudinary ping ok: %s", ping)
+        except Exception:
+            logging.info("Cloudinary ping not available or failed (credentials might still be OK)")
+        return True
     except Exception:
-        logging.exception("Cloudinary config failed")
+        logging.exception("Cloudinary configuration failed")
+        return False
 
-def upload_to_cloudinary(file_path: str, public_id: Optional[str] = None) -> Optional[str]:
-    if cloudinary is None:
+CLOUDINARY_CONFIGURED = _configure_cloudinary()
+
+def upload_to_cloudinary(file_path: str, public_id: Optional[str] = None, max_retries: int = 2) -> Optional[str]:
+    if not CLOUDINARY_CONFIGURED or cloudinary is None:
+        logging.info("Cloudinary not configured - skipping upload")
         return None
-    try:
-        filesize = Path(file_path).stat().st_size
-        if filesize > 10 * 1024 * 1024 and hasattr(cloudinary.uploader, "upload_large"):
-            res = cloudinary.uploader.upload_large(file_path, resource_type="video", public_id=public_id, chunk_size=6000000)
-        else:
-            res = cloudinary.uploader.upload(file_path, resource_type="video", public_id=public_id)
-        return res.get("secure_url") or res.get("url")
-    except Exception:
-        logging.exception("Cloudinary upload failed")
+    if not Path(file_path).exists():
+        logging.error("upload_to_cloudinary: file not found %s", file_path)
         return None
 
-# --- Replicate helpers ---
-FAST_DEFAULTS: Dict[str, Any] = {
-    "duration": 5, "fps": 12, "width": 512, "height": 288, "steps": 20, "samples": 1, "guidance_scale": 6
-}
+    attempt = 0
+    while attempt <= max_retries:
+        attempt += 1
+        try:
+            filesize = Path(file_path).stat().st_size
+            kwargs = {"resource_type": "video"}
+            if public_id:
+                kwargs["public_id"] = public_id
+            # choose upload_large for big files if available
+            if filesize > 10 * 1024 * 1024 and hasattr(cloudinary.uploader, "upload_large"):
+                logging.info("Cloudinary upload_large attempt %d for %s", attempt, file_path)
+                res = cloudinary.uploader.upload_large(str(file_path), **kwargs, chunk_size=6000000)
+            else:
+                logging.info("Cloudinary upload attempt %d for %s", attempt, file_path)
+                res = cloudinary.uploader.upload(str(file_path), **kwargs)
+            if isinstance(res, dict):
+                url = res.get("secure_url") or res.get("url")
+                if url:
+                    logging.info("Cloudinary upload success (attempt %d): %s", attempt, url)
+                    return url
+                logging.warning("Cloudinary upload returned no url (attempt %d): %s", attempt, repr(res)[:500])
+            else:
+                logging.warning("Cloudinary upload returned unexpected type (attempt %d): %s", attempt, type(res))
+        except Exception as e:
+            logging.exception("Cloudinary upload attempt %d failed: %s", attempt, e)
+        time.sleep(1 + attempt)
+    logging.error("Cloudinary upload failed after %d attempts", max_retries + 1)
+    return None
 
+# --- Replicate helpers (unchanged logic but safer) ---
 def _guess_ext_from_url(url: str) -> str:
-    for ext in [".mp4", ".webm", ".gif"]:
-        if ext in url: return ext
+    for ext in (".mp4", ".webm", ".gif"):
+        if ext in url:
+            return ext
     return ".mp4"
 
 def _download_to_file(url: str) -> str:
@@ -201,7 +256,8 @@ def _download_to_file(url: str) -> str:
     r.raise_for_status()
     with open(out, "wb") as f:
         for chunk in r.iter_content(8192):
-            if chunk: f.write(chunk)
+            if chunk:
+                f.write(chunk)
     return str(out)
 
 def _write_bytes_to_file(data: bytes, ext: str = ".mp4") -> str:
@@ -210,62 +266,42 @@ def _write_bytes_to_file(data: bytes, ext: str = ".mp4") -> str:
     return str(out_path)
 
 def _process_replicate_item(item) -> List[str]:
-    """
-    Try multiple strategies to extract/download a video from a replicate output item.
-    Returns list of local file paths (0 or more).
-    """
     out_paths: List[str] = []
-
-    # 1) string URL
+    # many strategies — keep your existing robust attempts
     try:
         if isinstance(item, str) and item.startswith("http"):
-            out_paths.append(_download_to_file(item))
-            return out_paths
+            out_paths.append(_download_to_file(item)); return out_paths
     except Exception:
-        logging.exception("Error processing string item")
-
-    # 2) callable .url()
+        logging.exception("processing string item")
     try:
         url_callable = getattr(item, "url", None)
         if callable(url_callable):
             try:
                 url_val = url_callable()
                 if isinstance(url_val, str) and url_val.startswith("http"):
-                    out_paths.append(_download_to_file(url_val))
-                    return out_paths
-                # Sometimes .url() returns a FileOutput-like object with .url property:
+                    out_paths.append(_download_to_file(url_val)); return out_paths
                 if hasattr(url_val, "url") and isinstance(url_val.url, str) and url_val.url.startswith("http"):
-                    out_paths.append(_download_to_file(url_val.url))
-                    return out_paths
+                    out_paths.append(_download_to_file(url_val.url)); return out_paths
             except TypeError:
-                # some .url attributes are property-like; handled below
                 pass
             except Exception:
-                logging.exception("Calling item.url() failed")
+                logging.exception("calling item.url() failed")
     except Exception:
-        logging.exception("Checking item.url failed")
-
-    # 3) property .url (non-callable)
+        logging.exception("checking item.url failed")
     try:
         url_prop = getattr(item, "url", None)
         if isinstance(url_prop, str) and url_prop.startswith("http"):
-            out_paths.append(_download_to_file(url_prop))
-            return out_paths
+            out_paths.append(_download_to_file(url_prop)); return out_paths
     except Exception:
         logging.exception("item.url property check failed")
-
-    # 4) .read() -> bytes
     try:
         read_fn = getattr(item, "read", None)
         if callable(read_fn):
             data = read_fn()
             if isinstance(data, (bytes, bytearray)):
-                out_paths.append(_write_bytes_to_file(bytes(data), ".mp4"))
-                return out_paths
+                out_paths.append(_write_bytes_to_file(bytes(data), ".mp4")); return out_paths
     except Exception:
-        logging.exception("Calling item.read() failed")
-
-    # 5) .open() -> file-like
+        logging.exception("calling item.read failed")
     try:
         open_fn = getattr(item, "open", None)
         if callable(open_fn):
@@ -273,17 +309,12 @@ def _process_replicate_item(item) -> List[str]:
             try:
                 data = fobj.read()
                 if isinstance(data, (bytes, bytearray)):
-                    out_paths.append(_write_bytes_to_file(bytes(data), ".mp4"))
-                    return out_paths
+                    out_paths.append(_write_bytes_to_file(bytes(data), ".mp4")); return out_paths
             finally:
-                try:
-                    fobj.close()
-                except Exception:
-                    pass
+                try: fobj.close()
+                except Exception: pass
     except Exception:
-        logging.exception("item.open() handling failed")
-
-    # 6) .stream() -> iterable chunks
+        logging.exception("item.open handling failed")
     try:
         stream_fn = getattr(item, "stream", None)
         if callable(stream_fn):
@@ -293,70 +324,52 @@ def _process_replicate_item(item) -> List[str]:
                 for chunk in stream:
                     if isinstance(chunk, (bytes, bytearray)):
                         f.write(chunk)
-            out_paths.append(str(out_path))
-            return out_paths
+            out_paths.append(str(out_path)); return out_paths
     except Exception:
-        logging.exception("item.stream() handling failed")
-
-    # 7) download/save methods
+        logging.exception("item.stream handling failed")
     try:
         download_fn = getattr(item, "download", None) or getattr(item, "save", None)
         if callable(download_fn):
             out_path = VIDEO_DIR / f"{uuid.uuid4().hex}.mp4"
             try:
                 res = download_fn(str(out_path))
-                # if download_fn returns a path or writes file, check
                 if isinstance(res, str) and Path(res).exists():
-                    out_paths.append(res)
-                    return out_paths
+                    out_paths.append(res); return out_paths
                 if Path(out_path).exists():
-                    out_paths.append(str(out_path))
-                    return out_paths
+                    out_paths.append(str(out_path)); return out_paths
             except Exception:
-                logging.exception("item.download/save() failed")
+                logging.exception("item.download/save failed")
     except Exception:
         logging.exception("item.download/save check failed")
-
-    # 8) dict-like: try common keys
     try:
         if isinstance(item, dict):
             for key in ("url", "output_url", "download_url", "file", "artifact", "data"):
                 v = item.get(key)
                 if isinstance(v, str) and v.startswith("http"):
-                    out_paths.append(_download_to_file(v))
-                    return out_paths
+                    out_paths.append(_download_to_file(v)); return out_paths
                 elif isinstance(v, (bytes, bytearray)):
-                    out_paths.append(_write_bytes_to_file(bytes(v), ".mp4"))
-                    return out_paths
+                    out_paths.append(_write_bytes_to_file(bytes(v), ".mp4")); return out_paths
     except Exception:
-        logging.exception("dict-like item handling failed")
-
-    # 9) last resort debug logging
+        logging.exception("dict-like handling failed")
     try:
-        logging.info("Unrecognized replicate output item type: %s", type(item))
-        logging.info("repr(item)[:500]: %s", repr(item)[:500])
-        logging.info("dir(item) (partial): %s", ", ".join(dir(item)[:200]))
+        logging.info("Unrecognized replicate output type: %s", type(item))
     except Exception:
         pass
-
     return out_paths
 
 def call_replicate_minimax(prompt: str, options: Optional[dict] = None) -> List[str]:
     if not REPLICATE_API_TOKEN or replicate is None:
         raise RuntimeError("Replicate not configured")
-
     norm = _normalize_prompt(prompt)
     cached = load_cache(norm)
     if cached and Path(cached).exists():
+        logging.info("Using cached video for prompt")
         return [cached]
-
     payload = {**FAST_DEFAULTS, **(options or {}), "prompt": prompt}
     output = replicate.run(REPLICATE_MODEL, input=payload)
-
     files: List[str] = _process_replicate_item(output)
     if not files:
         raise RuntimeError("No downloadable video returned from replicate")
-
     save_cache(norm, files[0], {"model": REPLICATE_MODEL})
     return files
 
@@ -375,30 +388,61 @@ def compress_for_whatsapp(in_path: str) -> str:
         logging.exception("Compression failed")
     return in_path
 
-# --- Twilio send ---
+# --- Twilio send helpers ---
 def _public_media_url(filename: str) -> Optional[str]:
-    return f"{PUBLIC_BASE_URL.rstrip('/')}/media/{filename}" if PUBLIC_BASE_URL else None
+    if not PUBLIC_BASE_URL:
+        return None
+    return f"{PUBLIC_BASE_URL}/media/{filename}"
 
-def send_twilio_message(to_whatsapp: str, text: str, filename: Optional[str] = None, media_url: Optional[str] = None) -> bool:
-    if not twilio_client:
-        return False
+def _ensure_whatsapp_prefix(number: Optional[str]) -> Optional[str]:
+    if not number:
+        return None
+    s = number.strip()
+    if s.startswith("whatsapp:"):
+        return s
+    if s.startswith("+"):
+        return f"whatsapp:{s}"
+    # maybe user passed "whatsapp:+123", just return it
+    return f"whatsapp:{s}"
+
+def send_twilio_message(to_whatsapp: str, text: str, filename: Optional[str] = None, media_url: Optional[str] = None):
+    """
+    Sends a whatsapp message via Twilio.
+    Returns Twilio message instance on success, otherwise None.
+    """
+    if twilio_client is None:
+        logging.error("twilio_client is not configured")
+        return None
+
+    from_val = _ensure_whatsapp_prefix(TWILIO_WHATSAPP_FROM)
+    to_val = _ensure_whatsapp_prefix(to_whatsapp)
+
+    if not from_val:
+        logging.error("Invalid TWILIO_WHATSAPP_FROM: %s", TWILIO_WHATSAPP_FROM)
+        return None
+    if not to_val:
+        logging.error("Invalid to_whatsapp: %s", to_whatsapp)
+        return None
+
     try:
+        logging.info("Twilio send: from=%s to=%s has_media=%s media_url=%s", from_val, to_val, bool(media_url or filename), media_url or filename)
         if media_url:
-            twilio_client.messages.create(body=text, from_=TWILIO_WHATSAPP_FROM, to=to_whatsapp, media_url=[media_url])
+            msg = twilio_client.messages.create(body=text, from_=from_val, to=to_val, media_url=[media_url])
         elif filename:
             url = _public_media_url(filename)
             if url:
-                twilio_client.messages.create(body=text, from_=TWILIO_WHATSAPP_FROM, to=to_whatsapp, media_url=[url])
+                msg = twilio_client.messages.create(body=text, from_=from_val, to=to_val, media_url=[url])
             else:
-                twilio_client.messages.create(body=f"{text}\n\nYour file is ready: {filename}", from_=TWILIO_WHATSAPP_FROM, to=to_whatsapp)
+                msg = twilio_client.messages.create(body=f"{text}\n\nYour file is ready: {filename}", from_=from_val, to=to_val)
         else:
-            twilio_client.messages.create(body=text, from_=TWILIO_WHATSAPP_FROM, to=to_whatsapp)
-        return True
-    except Exception:
-        logging.exception("Twilio send failed")
-        return False
+            msg = twilio_client.messages.create(body=text, from_=from_val, to=to_val)
+        logging.info("Twilio created message sid=%s status=%s", getattr(msg, "sid", None), getattr(msg, "status", None))
+        return msg
+    except Exception as e:
+        logging.exception("Twilio send failed: %s", e)
+        return None
 
-# --- Bot rules ---
+# --- Bot rules & OpenAI polish ---
 def get_rule_reply(text: str) -> Optional[str]:
     t = text.lower().strip()
     if any(w in t for w in ("hi", "hello", "hey")):
@@ -441,51 +485,100 @@ def worker_loop():
             sid = task.get("sid")
             from_num = task.get("from")
             options = task.get("options", {}) or {}
-            append_session(sid, "assistant", "🎬 Generating your video... this may take a while (usually < 2 minutes)")
+            logging.info("Processing task %s for %s", tid, from_num)
+            append_session(sid, "assistant", "🎬 Generating your video... this may take a little while")
             files: List[str] = []
             try:
                 files = call_replicate_minimax(prompt, options)
             except Exception as e:
                 err = str(e)
+                logging.exception("Generation failed for task %s: %s", tid, err)
                 append_session(sid, "assistant", f"❌ Generation failed: {err}")
                 tasks_col.update_one({"task_id": tid}, {"$set": {"status": "failed", "error": err, "finished_at": datetime.now(timezone.utc)}})
-                if from_num: send_twilio_message(from_num, f"Generation failed: {err[:200]}")
+                if from_num:
+                    send_twilio_message(from_num, f"Generation failed: {err[:200]}")
                 continue
 
             if not files:
                 append_session(sid, "assistant", "❌ Generation returned no files.")
                 tasks_col.update_one({"task_id": tid}, {"$set": {"status": "failed", "error": "no files", "finished_at": datetime.now(timezone.utc)}})
-                if from_num: send_twilio_message(from_num, "No video was generated.")
+                if from_num:
+                    send_twilio_message(from_num, "No video was generated.")
                 continue
 
             send_path = compress_for_whatsapp(files[0])
             cloud_url = None
-            try:
-                public_id = f"ai_vids/{uuid.uuid4().hex}"
-                cloud_url = upload_to_cloudinary(send_path, public_id)
-            except Exception:
-                logging.exception("Cloudinary upload error")
+
+            # Try Cloudinary upload
+            if CLOUDINARY_CONFIGURED:
+                try:
+                    public_id = f"ai_vids/{uuid.uuid4().hex}"
+                    cloud_url = upload_to_cloudinary(send_path, public_id=public_id)
+                    if cloud_url:
+                        logging.info("Uploaded to Cloudinary: %s", cloud_url)
+                    else:
+                        logging.warning("Cloudinary upload returned None for task %s", tid)
+                except Exception:
+                    logging.exception("Cloudinary upload error for task %s", tid)
+            else:
+                logging.info("Cloudinary not configured; skipping upload")
+
+            # Fallback to local public url if cloud_url missing and PUBLIC_BASE_URL present
+            if not cloud_url and PUBLIC_BASE_URL:
+                cloud_url = _public_media_url(Path(send_path).name)
+                logging.info("Using fallback public media URL: %s", cloud_url)
 
             record_video(Path(send_path).name, send_path, prompt, sid, from_num, cloud_url=cloud_url)
-            tasks_col.update_one({"task_id": tid}, {"$set": {"status": "done", "finished_at": datetime.now(timezone.utc), "cloud_url": cloud_url}})
+            tasks_col.update_one({"task_id": tid}, {"$set": {"status": "done", "finished_at": datetime.now(timezone.utc), "cloud_url": cloud_url, "file_path": send_path}})
+
             append_session(sid, "assistant", f"✅ Video ready: {Path(send_path).name}")
 
+            # Send via Twilio
             if from_num:
-             media_url = cloud_url or _public_media_url(Path(send_path).name)
-             if media_url:
-               send_twilio_message(from_num, "✅ Here's your AI-generated video!", media_url=media_url)
-             else:
-               send_twilio_message(from_num, "Video generated but not hosted externally. Contact admin.")
+                media_url = cloud_url
+                if media_url:
+                    res = send_twilio_message(from_num, "✅ Here's your AI-generated video!", media_url=media_url)
+                    if res:
+                        logging.info("Twilio delivered message sid=%s", getattr(res, "sid", None))
+                        tasks_col.update_one({"task_id": tid}, {"$set": {"delivered": True, "delivery_time": datetime.now(timezone.utc)}})
+                    else:
+                        logging.error("Twilio failed to send media for task %s to %s (media_url=%s)", tid, from_num, media_url)
+                        tasks_col.update_one({"task_id": tid}, {"$set": {"delivered": False, "delivery_error": "Twilio send failed"}})
+                        # fallback: send a text link
+                        fallback_msg = f"✅ Your video is ready! View it here: {media_url}"
+                        send_twilio_message(from_num, fallback_msg)
+                else:
+                    logging.error("No media_url available to send for task %s", tid)
+                    send_twilio_message(from_num, "✅ Video generated but hosting failed. Contact admin.")
+            else:
+                logging.warning("No recipient phone (from) for task %s", tid)
 
         except Exception:
             logging.exception("Task processing failed")
         finally:
-            WORKER.task_done()
+            try:
+                WORKER.task_done()
+            except Exception:
+                pass
     logging.info("Worker stopped")
 
 threading.Thread(target=worker_loop, daemon=True).start()
 
 # --- Routes ---
+@app.route("/", methods=["GET", "HEAD"])
+def home():
+    return jsonify({"ok": True, "message": "AI video bot running"}), 200
+
+@app.route("/debug/send-test", methods=["GET"])
+def debug_send_test():
+    to = os.environ.get("DEBUG_SEND_TO")
+    if not to:
+        return jsonify({"error": "Set DEBUG_SEND_TO env var (e.g. whatsapp:+9199...)"}), 400
+    msg = send_twilio_message(to, "Test message from bot (debug)", media_url=None)
+    if msg:
+        return jsonify({"ok": True, "sid": getattr(msg, "sid", None), "status": getattr(msg, "status", None)})
+    return jsonify({"ok": False}), 500
+
 @app.route("/media/<path:fn>", methods=["GET"])
 def media(fn):
     p = VIDEO_DIR / fn
@@ -536,9 +629,8 @@ def twilio_webhook():
     # Normalize command
     cmd = body.lower().strip()
 
-    # --- Handle /status command ---
+    # quick commands
     if cmd == "/status":
-        # Find latest session for this user
         s = sessions_col.find_one({"messages.meta.from": from_number}, sort=[("created_at", -1)])
         if not s:
             reply = "No active sessions found for you."
@@ -552,18 +644,16 @@ def twilio_webhook():
                 for t in tasks:
                     status = t.get("status", "queued")
                     prompt = t.get("prompt", "")[:50]
-                    created = t.get("created_at").strftime("%Y-%m-%d %H:%M")
-                    lines.append(f"[{status}] {prompt} ({created})")
+                    created = t.get("created_at")
+                    created_str = created.strftime("%Y-%m-%d %H:%M") if isinstance(created, datetime) else str(created)
+                    lines.append(f"[{status}] {prompt} ({created_str})")
                 reply = "\n".join(lines)
         append_session(s.get("session_id") if s else create_session(), "assistant", reply)
         if MessagingResponse:
-            resp = MessagingResponse()
-            resp.message(reply)
-            return str(resp), 200
+            resp = MessagingResponse(); resp.message(reply); return str(resp), 200
         send_twilio_message(from_number, reply)
         return jsonify({"reply": reply}), 200
 
-    # --- Handle /history command ---
     if cmd == "/history":
         s = sessions_col.find_one({"messages.meta.from": from_number}, sort=[("created_at", -1)])
         if not s:
@@ -579,40 +669,39 @@ def twilio_webhook():
                     fname = v.get("filename")
                     url = v.get("cloud_url") or _public_media_url(fname)
                     prompt = v.get("prompt", "")[:50]
-                    created = v.get("created_at").strftime("%Y-%m-%d %H:%M")
-                    lines.append(f"{prompt}\n{url}\n({created})")
+                    created = v.get("created_at")
+                    created_str = created.strftime("%Y-%m-%d %H:%M") if isinstance(created, datetime) else str(created)
+                    lines.append(f"{prompt}\n{url}\n({created_str})")
                 reply = "\n\n".join(lines)
         append_session(s.get("session_id") if s else create_session(), "assistant", reply)
         if MessagingResponse:
-            resp = MessagingResponse()
-            resp.message(reply)
-            return str(resp), 200
+            resp = MessagingResponse(); resp.message(reply); return str(resp), 200
         send_twilio_message(from_number, reply)
         return jsonify({"reply": reply}), 200
 
-    # --- Existing prompt handling ---
+    # regular prompt handling
     r = get_rule_reply(body)
-    # Try to get latest session for this user
     s = sessions_col.find_one({"messages.meta.from": from_number}, sort=[("created_at", -1)])
     if s:
-     sid = s["session_id"]
+        sid = s["session_id"]
     else:
-     sid = create_session()
+        sid = create_session()
 
     append_session(sid, "user", body, {"from": from_number})
 
     if r:
         append_session(sid, "assistant", r)
         if MessagingResponse:
-            resp = MessagingResponse()
-            resp.message(r)
-            return str(resp), 200
+            resp = MessagingResponse(); resp.message(r); return str(resp), 200
         send_twilio_message(from_number, r)
         return jsonify({"reply": r}), 200
 
+    # polish and queue
+    session_msgs = get_session(sid).get("messages", [])
+    polished = polish_with_openai(body, session_msgs) or body
     tid = uuid.uuid4().hex
-    tasks_col.insert_one({"task_id": tid, "prompt": body, "sid": sid, "from": from_number, "status": "queued", "created_at": datetime.now(timezone.utc)})
-    WORKER.put({"task_id": tid, "prompt": body, "sid": sid, "from": from_number})
+    tasks_col.insert_one({"task_id": tid, "prompt": polished, "sid": sid, "from": from_number, "status": "queued", "created_at": datetime.now(timezone.utc)})
+    WORKER.put({"task_id": tid, "prompt": polished, "sid": sid, "from": from_number, "options": {}})
     ack = "🎬 Generating your video... I'll send it here when ready."
     append_session(sid, "assistant", ack)
     if MessagingResponse:
@@ -620,10 +709,5 @@ def twilio_webhook():
     send_twilio_message(from_number, ack)
     return jsonify({"status": "queued", "reply": ack}), 200
 
-
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), debug=True)
-
-
-
-
