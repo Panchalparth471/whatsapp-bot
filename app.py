@@ -59,6 +59,7 @@ except Exception:
 
 # --- Config ---
 ROOT = Path(__file__).parent.resolve()
+# For ephemeral hosts (Vercel) you might want to use /tmp. For persistent hosts leave as below.
 VIDEO_DIR = ROOT / "generated_videos"
 VIDEO_DIR.mkdir(exist_ok=True)
 SAMPLE_ASSET = Path(os.environ.get("SAMPLE_ASSET", str(ROOT / "sample_assets" / "sample.mp4")))
@@ -267,7 +268,6 @@ def _write_bytes_to_file(data: bytes, ext: str = ".mp4") -> str:
 
 def _process_replicate_item(item) -> List[str]:
     out_paths: List[str] = []
-    # many strategies — keep your existing robust attempts
     try:
         if isinstance(item, str) and item.startswith("http"):
             out_paths.append(_download_to_file(item)); return out_paths
@@ -319,7 +319,7 @@ def _process_replicate_item(item) -> List[str]:
         stream_fn = getattr(item, "stream", None)
         if callable(stream_fn):
             stream = stream_fn()
-            out_path = VIDEO_DIR / f"{uuid.uuid4().hex}.p4"
+            out_path = VIDEO_DIR / f"{uuid.uuid4().hex}.mp4"
             with open(out_path, "wb") as f:
                 for chunk in stream:
                     if isinstance(chunk, (bytes, bytearray)):
@@ -537,12 +537,11 @@ def worker_loop():
             if from_num:
                 media_url = cloud_url
                 if media_url:
-                    # send the media message first
                     res = send_twilio_message(from_num, "✅ Here's your AI-generated video!", media_url=media_url)
                     if res:
                         logging.info("Twilio delivered media message sid=%s", getattr(res, "sid", None))
                         tasks_col.update_one({"task_id": tid}, {"$set": {"delivered": True, "delivery_time": datetime.now(timezone.utc)}})
-                        # === NEW: send follow-up text prompting for another prompt ===
+                        # follow-up text
                         try:
                             follow_up_text = "✅ Here's your AI-generated video! Send another prompt to create more."
                             follow_res = send_twilio_message(from_num, follow_up_text)
