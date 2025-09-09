@@ -1,4 +1,3 @@
-# app.py
 """
 Twilio WhatsApp bot backend (Flask)
 - Uses MongoDB for sessions, cache, videos, tasks
@@ -17,7 +16,7 @@ import threading
 import queue
 import subprocess
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 
 from flask import Flask, request, send_file, jsonify, redirect
@@ -133,7 +132,7 @@ def _normalize_prompt(p: str) -> str:
     return " ".join(p.strip().lower().split())
 
 def save_cache(prompt_norm: str, file_path: str, meta: dict = None):
-    cache_col.update_one({"prompt_norm": prompt_norm}, {"$set": {"file_path": file_path, "meta": meta or {}, "updated_at": datetime.utcnow()}}, upsert=True)
+    cache_col.update_one({"prompt_norm": prompt_norm}, {"$set": {"file_path": file_path, "meta": meta or {}, "updated_at": datetime.now(timezone.utc)}}, upsert=True)
 
 def load_cache(prompt_norm: str) -> Optional[str]:
     r = cache_col.find_one({"prompt_norm": prompt_norm})
@@ -141,18 +140,18 @@ def load_cache(prompt_norm: str) -> Optional[str]:
 
 def create_session() -> str:
     sid = uuid.uuid4().hex
-    sessions_col.insert_one({"session_id": sid, "created_at": datetime.utcnow(), "messages": []})
+    sessions_col.insert_one({"session_id": sid, "created_at": datetime.now(timezone.utc), "messages": []})
     return sid
 
 def append_session(sid: str, role: str, text: str, meta: Optional[dict] = None):
-    msg = {"role": role, "text": text, "meta": meta or {}, "ts": datetime.utcnow()}
+    msg = {"role": role, "text": text, "meta": meta or {}, "ts": datetime.now(timezone.utc)}
     sessions_col.update_one({"session_id": sid}, {"$push": {"messages": msg}}, upsert=True)
 
 def get_session(sid: str) -> dict:
     return sessions_col.find_one({"session_id": sid}) or {"session_id": sid, "messages": []}
 
 def record_video(filename: str, path: str, prompt: str, session_id: Optional[str], from_number: Optional[str], cloud_url: Optional[str] = None):
-    doc = {"filename": filename, "path": path, "prompt": prompt, "session_id": session_id, "from": from_number, "created_at": datetime.utcnow()}
+    doc = {"filename": filename, "path": path, "prompt": prompt, "session_id": session_id, "from": from_number, "created_at": datetime.now(timezone.utc)}
     if cloud_url:
         doc["cloud_url"] = cloud_url
     videos_col.insert_one(doc)
@@ -624,6 +623,7 @@ def twilio_webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), debug=True)
+
 
 
 
