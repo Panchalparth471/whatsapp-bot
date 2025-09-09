@@ -448,13 +448,13 @@ def worker_loop():
             except Exception as e:
                 err = str(e)
                 append_session(sid, "assistant", f"❌ Generation failed: {err}")
-                tasks_col.update_one({"task_id": tid}, {"$set": {"status": "failed", "error": err, "finished_at": datetime.utcnow()}})
+                tasks_col.update_one({"task_id": tid}, {"$set": {"status": "failed", "error": err, "finished_at": datetime.now(timezone.utc)}})
                 if from_num: send_twilio_message(from_num, f"Generation failed: {err[:200]}")
                 continue
 
             if not files:
                 append_session(sid, "assistant", "❌ Generation returned no files.")
-                tasks_col.update_one({"task_id": tid}, {"$set": {"status": "failed", "error": "no files", "finished_at": datetime.utcnow()}})
+                tasks_col.update_one({"task_id": tid}, {"$set": {"status": "failed", "error": "no files", "finished_at": datetime.now(timezone.utc)}})
                 if from_num: send_twilio_message(from_num, "No video was generated.")
                 continue
 
@@ -467,7 +467,7 @@ def worker_loop():
                 logging.exception("Cloudinary upload error")
 
             record_video(Path(send_path).name, send_path, prompt, sid, from_num, cloud_url=cloud_url)
-            tasks_col.update_one({"task_id": tid}, {"$set": {"status": "done", "finished_at": datetime.utcnow(), "cloud_url": cloud_url}})
+            tasks_col.update_one({"task_id": tid}, {"$set": {"status": "done", "finished_at": datetime.now(timezone.utc), "cloud_url": cloud_url}})
             append_session(sid, "assistant", f"✅ Video ready: {Path(send_path).name}")
 
             if from_num:
@@ -507,7 +507,7 @@ def api_generate():
     session_msgs = get_session(sid).get("messages", [])
     p2 = polish_with_openai(prompt, session_msgs) or prompt
     tid = uuid.uuid4().hex
-    tasks_col.insert_one({"task_id": tid, "prompt": p2, "sid": sid, "from": body.get("from"), "status": "queued", "created_at": datetime.utcnow()})
+    tasks_col.insert_one({"task_id": tid, "prompt": p2, "sid": sid, "from": body.get("from"), "status": "queued", "created_at": datetime.now(timezone.utc)})
     WORKER.put({"task_id": tid, "prompt": p2, "sid": sid, "from": body.get("from"), "options": body.get("options", {})})
     return jsonify({"status": "queued", "task_id": tid, "session_id": sid}), 202
 
@@ -611,7 +611,7 @@ def twilio_webhook():
         return jsonify({"reply": r}), 200
 
     tid = uuid.uuid4().hex
-    tasks_col.insert_one({"task_id": tid, "prompt": body, "sid": sid, "from": from_number, "status": "queued", "created_at": datetime.utcnow()})
+    tasks_col.insert_one({"task_id": tid, "prompt": body, "sid": sid, "from": from_number, "status": "queued", "created_at": datetime.now(timezone.utc)})
     WORKER.put({"task_id": tid, "prompt": body, "sid": sid, "from": from_number})
     ack = "🎬 Generating your video... I'll send it here when ready."
     append_session(sid, "assistant", ack)
@@ -623,6 +623,7 @@ def twilio_webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), debug=True)
+
 
 
 
