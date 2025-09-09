@@ -1,3 +1,4 @@
+# server.py
 """
 Twilio WhatsApp bot backend (Flask)
 - Uses MongoDB for sessions, cache, videos, tasks
@@ -318,7 +319,7 @@ def _process_replicate_item(item) -> List[str]:
         stream_fn = getattr(item, "stream", None)
         if callable(stream_fn):
             stream = stream_fn()
-            out_path = VIDEO_DIR / f"{uuid.uuid4().hex}.mp4"
+            out_path = VIDEO_DIR / f"{uuid.uuid4().hex}.p4"
             with open(out_path, "wb") as f:
                 for chunk in stream:
                     if isinstance(chunk, (bytes, bytearray)):
@@ -536,10 +537,21 @@ def worker_loop():
             if from_num:
                 media_url = cloud_url
                 if media_url:
+                    # send the media message first
                     res = send_twilio_message(from_num, "✅ Here's your AI-generated video!", media_url=media_url)
                     if res:
-                        logging.info("Twilio delivered message sid=%s", getattr(res, "sid", None))
+                        logging.info("Twilio delivered media message sid=%s", getattr(res, "sid", None))
                         tasks_col.update_one({"task_id": tid}, {"$set": {"delivered": True, "delivery_time": datetime.now(timezone.utc)}})
+                        # === NEW: send follow-up text prompting for another prompt ===
+                        try:
+                            follow_up_text = "✅ Here's your AI-generated video! Send another prompt to create more."
+                            follow_res = send_twilio_message(from_num, follow_up_text)
+                            if follow_res:
+                                logging.info("Sent follow-up text after media to %s sid=%s", from_num, getattr(follow_res, "sid", None))
+                            else:
+                                logging.warning("Failed to send follow-up text after media to %s", from_num)
+                        except Exception:
+                            logging.exception("Failed sending follow-up message after media")
                     else:
                         logging.error("Twilio failed to send media for task %s to %s (media_url=%s)", tid, from_num, media_url)
                         tasks_col.update_one({"task_id": tid}, {"$set": {"delivered": False, "delivery_error": "Twilio send failed"}})
