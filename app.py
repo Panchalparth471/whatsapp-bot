@@ -472,12 +472,12 @@ def worker_loop():
             append_session(sid, "assistant", f"✅ Video ready: {Path(send_path).name}")
 
             if from_num:
-                if cloud_url:
-                    send_twilio_message(from_num, "✅ Here's your AI-generated video!", media_url=cloud_url)
-                elif PUBLIC_BASE_URL:
-                    send_twilio_message(from_num, "✅ Here's your AI-generated video!", filename=Path(send_path).name)
-                else:
-                    send_twilio_message(from_num, "Video generated but not hosted externally. Contact admin.")
+             media_url = cloud_url or _public_media_url(Path(send_path).name)
+             if media_url:
+               send_twilio_message(from_num, "✅ Here's your AI-generated video!", media_url=media_url)
+             else:
+               send_twilio_message(from_num, "Video generated but not hosted externally. Contact admin.")
+
         except Exception:
             logging.exception("Task processing failed")
         finally:
@@ -624,5 +624,6 @@ def twilio_webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), debug=True)
+
 
 
