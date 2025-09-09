@@ -168,33 +168,70 @@ def record_video(filename: str, path: str, prompt: str, session_id: Optional[str
     videos_col.insert_one(doc)
 
 # --- Cloudinary ---
-if cloudinary:
+def configure_cloudinary():
+    """Configure Cloudinary with proper error handling"""
+    if cloudinary is None:
+        logging.warning("Cloudinary package not available")
+        return False
+    
     try:
         if CLOUDINARY_URL:
             cloudinary.config(cloudinary_url=CLOUDINARY_URL)
-        else:
+            logging.info("Cloudinary configured with CLOUDINARY_URL")
+        elif CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
             cloudinary.config(
-                cloud_name=CLOUDINARY_CLOUD_NAME or None,
-                api_key=CLOUDINARY_API_KEY or None,
-                api_secret=CLOUDINARY_API_SECRET or None,
+                cloud_name=CLOUDINARY_CLOUD_NAME,
+                api_key=CLOUDINARY_API_KEY,
+                api_secret=CLOUDINARY_API_SECRET,
                 secure=True
             )
-        logging.info("Cloudinary configured")
-    except Exception:
-        logging.exception("Cloudinary config failed")
+            logging.info("Cloudinary configured with individual credentials")
+        else:
+            logging.warning("Cloudinary credentials not properly set")
+            return False
+        
+        # Test configuration
+        test_result = cloudinary.api.ping()
+        logging.info("Cloudinary ping successful: %s", test_result)
+        return True
+    except Exception as e:
+        logging.exception("Cloudinary config failed: %s", e)
+        return False
+
+# Configure Cloudinary at startup
+CLOUDINARY_CONFIGURED = configure_cloudinary()
 
 def upload_to_cloudinary(file_path: str, public_id: Optional[str] = None) -> Optional[str]:
-    if cloudinary is None:
+    if not CLOUDINARY_CONFIGURED or cloudinary is None:
+        logging.warning("Cloudinary not configured, skipping upload")
         return None
+    
     try:
+        if not Path(file_path).exists():
+            logging.error("File does not exist: %s", file_path)
+            return None
+            
         filesize = Path(file_path).stat().st_size
+        logging.info("Uploading file to Cloudinary: %s (size: %d bytes)", file_path, filesize)
+        
+        upload_params = {
+            "resource_type": "video",
+            "public_id": public_id,
+            "overwrite": True,
+            "invalidate": True
+        }
+        
         if filesize > 10 * 1024 * 1024 and hasattr(cloudinary.uploader, "upload_large"):
-            res = cloudinary.uploader.upload_large(file_path, resource_type="video", public_id=public_id, chunk_size=6000000)
+            upload_params["chunk_size"] = 6000000
+            res = cloudinary.uploader.upload_large(file_path, **upload_params)
         else:
-            res = cloudinary.uploader.upload(file_path, resource_type="video", public_id=public_id)
-        return res.get("secure_url") or res.get("url")
-    except Exception:
-        logging.exception("Cloudinary upload failed")
+            res = cloudinary.uploader.upload(file_path, **upload_params)
+        
+        url = res.get("secure_url") or res.get("url")
+        logging.info("Cloudinary upload successful: %s -> %s", file_path, url)
+        return url
+    except Exception as e:
+        logging.exception("Cloudinary upload failed for %s: %s", file_path, e)
         return None
 
 # --- Replicate helpers ---
@@ -509,35 +546,63 @@ def worker_loop():
 
             send_path = compress_for_whatsapp(files[0])
             cloud_url = None
-            try:
-                public_id = f"ai_vids/{uuid.uuid4().hex}"
-                cloud_url = upload_to_cloudinary(send_path, public_id)
-            except Exception:
-                logging.exception("Cloudinary upload error")
+            
+            # Upload to Cloudinary
+            if CLOUDINARY_CONFIGURED:
+                try:
+                    public_id = f"ai_vids/{uuid.uuid4().hex}"
+                    cloud_url = upload_to_cloudinary(send_path, public_id)
+                    if cloud_url:
+                        logging.info("Successfully uploaded to Cloudinary: %s", cloud_url)
+                    else:
+                        logging.warning("Cloudinary upload returned None for task %s", tid)
+                except Exception as e:
+                    logging.exception("Cloudinary upload error for task %s: %s", tid, e)
+            else:
+                logging.warning("Cloudinary not configured, skipping upload for task %s", tid)
 
+            # Record video in database
             record_video(Path(send_path).name, send_path, prompt, sid, from_num, cloud_url=cloud_url)
-            tasks_col.update_one({"task_id": tid}, {"$set": {"status": "done", "finished_at": datetime.now(timezone.utc), "cloud_url": cloud_url}})
+            
+            # Update task status
+            task_update = {
+                "status": "done", 
+                "finished_at": datetime.now(timezone.utc),
+                "file_path": send_path
+            }
+            if cloud_url:
+                task_update["cloud_url"] = cloud_url
+            
+            tasks_col.update_one({"task_id": tid}, {"$set": task_update})
 
             append_session(sid, "assistant", f"✅ Video ready: {Path(send_path).name}")
 
+            # Send video via WhatsApp
             if from_num:
-                media_url = cloud_url or _public_media_url(Path(send_path).name)
+                media_url = cloud_url if cloud_url else _public_media_url(Path(send_path).name)
+                
                 if media_url:
+                    logging.info("Attempting to send video to %s with media_url: %s", from_num, media_url)
                     res = send_twilio_message(from_num, "✅ Here's your AI-generated video!", media_url=media_url)
-                    if not res:
-                        logging.error("Failed to deliver Twilio message for task %s to %s (media_url=%s)", tid, from_num, media_url)
-                        # Optionally: update task to reflect delivery failure
-                        tasks_col.update_one({"task_id": tid}, {"$set": {"delivered": False}})
-                        # still leave video recorded; admin can retry manually
+                    if res:
+                        logging.info("Successfully delivered video to %s for task %s", from_num, tid)
+                        tasks_col.update_one({"task_id": tid}, {"$set": {"delivered": True, "delivery_time": datetime.now(timezone.utc)}})
                     else:
-                        logging.info("Delivered Twilio message for task %s to %s", tid, from_num)
-                        tasks_col.update_one({"task_id": tid}, {"$set": {"delivered": True}})
+                        logging.error("Failed to deliver video to %s for task %s", from_num, tid)
+                        tasks_col.update_one({"task_id": tid}, {"$set": {"delivered": False, "delivery_error": "Twilio send failed"}})
+                        # Try sending without media as fallback
+                        fallback_msg = f"✅ Your video is ready! You can view it at: {media_url}"
+                        send_twilio_message(from_num, fallback_msg)
                 else:
-                    logging.error("No media_url available for task %s", tid)
-                    send_twilio_message(from_num, "Video generated but not hosted externally. Contact admin.")
+                    logging.error("No media_url available for task %s (cloud_url=%s, public_url=%s)", tid, cloud_url, _public_media_url(Path(send_path).name))
+                    fallback_msg = "✅ Video generated but unable to deliver automatically. Please contact support."
+                    send_twilio_message(from_num, fallback_msg)
+                    tasks_col.update_one({"task_id": tid}, {"$set": {"delivered": False, "delivery_error": "No media URL available"}})
+            else:
+                logging.warning("No from_number for task %s, cannot send WhatsApp message", tid)
 
-        except Exception:
-            logging.exception("Task processing failed")
+        except Exception as e:
+            logging.exception("Task processing failed for task %s: %s", task.get("task_id", "unknown"), e)
         finally:
             try:
                 WORKER.task_done()
