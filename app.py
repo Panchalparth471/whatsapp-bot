@@ -1,3 +1,4 @@
+# server.py
 """
 Twilio WhatsApp bot backend (Flask)
 - Uses MongoDB for sessions, cache, videos, tasks
@@ -9,7 +10,6 @@ Twilio WhatsApp bot backend (Flask)
 """
 
 import os
-import time
 import uuid
 import logging
 import threading
@@ -90,6 +90,13 @@ LOG_DIR.mkdir(exist_ok=True)
 logging.basicConfig(filename=str(LOG_DIR / "server.log"), level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 
+# Also log to console for immediate visibility (optional)
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+console.setFormatter(formatter)
+logging.getLogger("").addHandler(console)
+
 # --- Flask ---
 app = Flask(__name__)
 
@@ -112,7 +119,11 @@ except Exception:
 # --- Twilio ---
 twilio_client = None
 if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TwilioClient:
-    twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    try:
+        twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        logging.info("Twilio client configured")
+    except Exception:
+        logging.exception("Failed to create Twilio client")
 
 # --- Helper functions ---
 from bson import ObjectId
@@ -168,6 +179,7 @@ if cloudinary:
                 api_secret=CLOUDINARY_API_SECRET or None,
                 secure=True
             )
+        logging.info("Cloudinary configured")
     except Exception:
         logging.exception("Cloudinary config failed")
 
@@ -233,12 +245,10 @@ def _process_replicate_item(item) -> List[str]:
                 if isinstance(url_val, str) and url_val.startswith("http"):
                     out_paths.append(_download_to_file(url_val))
                     return out_paths
-                # Sometimes .url() returns a FileOutput-like object with .url property:
                 if hasattr(url_val, "url") and isinstance(url_val.url, str) and url_val.url.startswith("http"):
                     out_paths.append(_download_to_file(url_val.url))
                     return out_paths
             except TypeError:
-                # some .url attributes are property-like; handled below
                 pass
             except Exception:
                 logging.exception("Calling item.url() failed")
@@ -305,7 +315,6 @@ def _process_replicate_item(item) -> List[str]:
             out_path = VIDEO_DIR / f"{uuid.uuid4().hex}.mp4"
             try:
                 res = download_fn(str(out_path))
-                # if download_fn returns a path or writes file, check
                 if isinstance(res, str) and Path(res).exists():
                     out_paths.append(res)
                     return out_paths
@@ -348,6 +357,7 @@ def call_replicate_minimax(prompt: str, options: Optional[dict] = None) -> List[
     norm = _normalize_prompt(prompt)
     cached = load_cache(norm)
     if cached and Path(cached).exists():
+        logging.info("Using cached video for prompt")
         return [cached]
 
     payload = {**FAST_DEFAULTS, **(options or {}), "prompt": prompt}
@@ -379,24 +389,56 @@ def compress_for_whatsapp(in_path: str) -> str:
 def _public_media_url(filename: str) -> Optional[str]:
     return f"{PUBLIC_BASE_URL.rstrip('/')}/media/{filename}" if PUBLIC_BASE_URL else None
 
-def send_twilio_message(to_whatsapp: str, text: str, filename: Optional[str] = None, media_url: Optional[str] = None) -> bool:
-    if not twilio_client:
-        return False
+def _ensure_whatsapp_prefix(number: Optional[str]) -> Optional[str]:
+    if not number:
+        return None
+    num = number.strip()
+    if num.startswith("whatsapp:"):
+        return num
+    # if it's already like +123456789, add whatsapp: prefix
+    return f"whatsapp:{num}"
+
+def send_twilio_message(to_whatsapp: str, text: str, filename: Optional[str] = None, media_url: Optional[str] = None):
+    """
+    Sends a whatsapp message via Twilio. Returns the Twilio MessageInstance on success,
+    otherwise returns None and logs exception details.
+    """
+    if twilio_client is None:
+        logging.error("Twilio client not configured. twilio_client is None.")
+        return None
+
+    from_val = _ensure_whatsapp_prefix(TWILIO_WHATSAPP_FROM)
+    to_val = _ensure_whatsapp_prefix(to_whatsapp)
+
+    if not from_val:
+        logging.error("TWILIO_WHATSAPP_FROM not set or invalid")
+        return None
+    if not to_val:
+        logging.error("to_whatsapp not provided or invalid: %s", to_whatsapp)
+        return None
+
+    try:
+        logging.info("Sending Twilio message — from=%s to=%s has_media=%s media_url=%s", from_val, to_val, bool(media_url or filename), media_url or filename)
+    except Exception:
+        pass
+
     try:
         if media_url:
-            twilio_client.messages.create(body=text, from_=TWILIO_WHATSAPP_FROM, to=to_whatsapp, media_url=[media_url])
+            msg = twilio_client.messages.create(body=text, from_=from_val, to=to_val, media_url=[media_url])
         elif filename:
             url = _public_media_url(filename)
             if url:
-                twilio_client.messages.create(body=text, from_=TWILIO_WHATSAPP_FROM, to=to_whatsapp, media_url=[url])
+                msg = twilio_client.messages.create(body=text, from_=from_val, to=to_val, media_url=[url])
             else:
-                twilio_client.messages.create(body=f"{text}\n\nYour file is ready: {filename}", from_=TWILIO_WHATSAPP_FROM, to=to_whatsapp)
+                msg = twilio_client.messages.create(body=f"{text}\n\nYour file is ready: {filename}", from_=from_val, to=to_val)
         else:
-            twilio_client.messages.create(body=text, from_=TWILIO_WHATSAPP_FROM, to=to_whatsapp)
-        return True
-    except Exception:
-        logging.exception("Twilio send failed")
-        return False
+            msg = twilio_client.messages.create(body=text, from_=from_val, to=to_val)
+
+        logging.info("Twilio message created sid=%s status=%s", getattr(msg, "sid", None), getattr(msg, "status", None))
+        return msg
+    except Exception as e:
+        logging.exception("Twilio send failed: %s", e)
+        return None
 
 # --- Bot rules ---
 def get_rule_reply(text: str) -> Optional[str]:
@@ -441,21 +483,28 @@ def worker_loop():
             sid = task.get("sid")
             from_num = task.get("from")
             options = task.get("options", {}) or {}
+
+            # Mark task started
+            tasks_col.update_one({"task_id": tid}, {"$set": {"status": "started", "started_at": datetime.now(timezone.utc)}}, upsert=True)
             append_session(sid, "assistant", "🎬 Generating your video... this may take a while (usually < 2 minutes)")
+
             files: List[str] = []
             try:
                 files = call_replicate_minimax(prompt, options)
             except Exception as e:
                 err = str(e)
+                logging.exception("Generation error for task %s: %s", tid, err)
                 append_session(sid, "assistant", f"❌ Generation failed: {err}")
                 tasks_col.update_one({"task_id": tid}, {"$set": {"status": "failed", "error": err, "finished_at": datetime.now(timezone.utc)}})
-                if from_num: send_twilio_message(from_num, f"Generation failed: {err[:200]}")
+                if from_num:
+                    send_twilio_message(from_num, f"Generation failed: {err[:200]}")
                 continue
 
             if not files:
                 append_session(sid, "assistant", "❌ Generation returned no files.")
                 tasks_col.update_one({"task_id": tid}, {"$set": {"status": "failed", "error": "no files", "finished_at": datetime.now(timezone.utc)}})
-                if from_num: send_twilio_message(from_num, "No video was generated.")
+                if from_num:
+                    send_twilio_message(from_num, "No video was generated.")
                 continue
 
             send_path = compress_for_whatsapp(files[0])
@@ -468,19 +517,32 @@ def worker_loop():
 
             record_video(Path(send_path).name, send_path, prompt, sid, from_num, cloud_url=cloud_url)
             tasks_col.update_one({"task_id": tid}, {"$set": {"status": "done", "finished_at": datetime.now(timezone.utc), "cloud_url": cloud_url}})
+
             append_session(sid, "assistant", f"✅ Video ready: {Path(send_path).name}")
 
             if from_num:
-             media_url = cloud_url or _public_media_url(Path(send_path).name)
-             if media_url:
-               send_twilio_message(from_num, "✅ Here's your AI-generated video!", media_url=media_url)
-             else:
-               send_twilio_message(from_num, "Video generated but not hosted externally. Contact admin.")
+                media_url = cloud_url or _public_media_url(Path(send_path).name)
+                if media_url:
+                    res = send_twilio_message(from_num, "✅ Here's your AI-generated video!", media_url=media_url)
+                    if not res:
+                        logging.error("Failed to deliver Twilio message for task %s to %s (media_url=%s)", tid, from_num, media_url)
+                        # Optionally: update task to reflect delivery failure
+                        tasks_col.update_one({"task_id": tid}, {"$set": {"delivered": False}})
+                        # still leave video recorded; admin can retry manually
+                    else:
+                        logging.info("Delivered Twilio message for task %s to %s", tid, from_num)
+                        tasks_col.update_one({"task_id": tid}, {"$set": {"delivered": True}})
+                else:
+                    logging.error("No media_url available for task %s", tid)
+                    send_twilio_message(from_num, "Video generated but not hosted externally. Contact admin.")
 
         except Exception:
             logging.exception("Task processing failed")
         finally:
-            WORKER.task_done()
+            try:
+                WORKER.task_done()
+            except Exception:
+                pass
     logging.info("Worker stopped")
 
 threading.Thread(target=worker_loop, daemon=True).start()
@@ -552,8 +614,9 @@ def twilio_webhook():
                 for t in tasks:
                     status = t.get("status", "queued")
                     prompt = t.get("prompt", "")[:50]
-                    created = t.get("created_at").strftime("%Y-%m-%d %H:%M")
-                    lines.append(f"[{status}] {prompt} ({created})")
+                    created = t.get("created_at")
+                    created_str = created.strftime("%Y-%m-%d %H:%M") if isinstance(created, datetime) else str(created)
+                    lines.append(f"[{status}] {prompt} ({created_str})")
                 reply = "\n".join(lines)
         append_session(s.get("session_id") if s else create_session(), "assistant", reply)
         if MessagingResponse:
@@ -579,8 +642,9 @@ def twilio_webhook():
                     fname = v.get("filename")
                     url = v.get("cloud_url") or _public_media_url(fname)
                     prompt = v.get("prompt", "")[:50]
-                    created = v.get("created_at").strftime("%Y-%m-%d %H:%M")
-                    lines.append(f"{prompt}\n{url}\n({created})")
+                    created = v.get("created_at")
+                    created_str = created.strftime("%Y-%m-%d %H:%M") if isinstance(created, datetime) else str(created)
+                    lines.append(f"{prompt}\n{url}\n({created_str})")
                 reply = "\n\n".join(lines)
         append_session(s.get("session_id") if s else create_session(), "assistant", reply)
         if MessagingResponse:
@@ -592,12 +656,11 @@ def twilio_webhook():
 
     # --- Existing prompt handling ---
     r = get_rule_reply(body)
-    # Try to get latest session for this user
     s = sessions_col.find_one({"messages.meta.from": from_number}, sort=[("created_at", -1)])
     if s:
-     sid = s["session_id"]
+        sid = s["session_id"]
     else:
-     sid = create_session()
+        sid = create_session()
 
     append_session(sid, "user", body, {"from": from_number})
 
@@ -623,8 +686,3 @@ def twilio_webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), debug=True)
-
-
-
-
-
