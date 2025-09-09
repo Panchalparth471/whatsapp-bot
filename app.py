@@ -593,8 +593,15 @@ def twilio_webhook():
 
     # --- Existing prompt handling ---
     r = get_rule_reply(body)
-    sid = create_session()
+    # Try to get latest session for this user
+    s = sessions_col.find_one({"messages.meta.from": from_number}, sort=[("created_at", -1)])
+    if s:
+     sid = s["session_id"]
+    else:
+     sid = create_session()
+
     append_session(sid, "user", body, {"from": from_number})
+
     if r:
         append_session(sid, "assistant", r)
         if MessagingResponse:
@@ -617,4 +624,5 @@ def twilio_webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), debug=True)
+
 
