@@ -19,6 +19,7 @@ requests
 # Data handling
 python-dotenv
 
-
+cloudinary
 python-dateutil
+
 
