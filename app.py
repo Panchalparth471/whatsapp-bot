@@ -534,6 +534,64 @@ def twilio_webhook():
     if not from_number:
         return jsonify({"error": "missing From"}), 400
 
+    # Normalize command
+    cmd = body.lower().strip()
+
+    # --- Handle /status command ---
+    if cmd == "/status":
+        # Find latest session for this user
+        s = sessions_col.find_one({"messages.meta.from": from_number}, sort=[("created_at", -1)])
+        if not s:
+            reply = "No active sessions found for you."
+        else:
+            sid = s["session_id"]
+            tasks = list(tasks_col.find({"sid": sid}).sort("created_at", -1))
+            if not tasks:
+                reply = "No tasks found for your session."
+            else:
+                lines = []
+                for t in tasks:
+                    status = t.get("status", "queued")
+                    prompt = t.get("prompt", "")[:50]
+                    created = t.get("created_at").strftime("%Y-%m-%d %H:%M")
+                    lines.append(f"[{status}] {prompt} ({created})")
+                reply = "\n".join(lines)
+        append_session(s.get("session_id") if s else create_session(), "assistant", reply)
+        if MessagingResponse:
+            resp = MessagingResponse()
+            resp.message(reply)
+            return str(resp), 200
+        send_twilio_message(from_number, reply)
+        return jsonify({"reply": reply}), 200
+
+    # --- Handle /history command ---
+    if cmd == "/history":
+        s = sessions_col.find_one({"messages.meta.from": from_number}, sort=[("created_at", -1)])
+        if not s:
+            reply = "No session history found for you."
+        else:
+            sid = s["session_id"]
+            videos = list(videos_col.find({"session_id": sid}).sort("created_at", -1))
+            if not videos:
+                reply = "No videos generated for your session yet."
+            else:
+                lines = []
+                for v in videos:
+                    fname = v.get("filename")
+                    url = v.get("cloud_url") or _public_media_url(fname)
+                    prompt = v.get("prompt", "")[:50]
+                    created = v.get("created_at").strftime("%Y-%m-%d %H:%M")
+                    lines.append(f"{prompt}\n{url}\n({created})")
+                reply = "\n\n".join(lines)
+        append_session(s.get("session_id") if s else create_session(), "assistant", reply)
+        if MessagingResponse:
+            resp = MessagingResponse()
+            resp.message(reply)
+            return str(resp), 200
+        send_twilio_message(from_number, reply)
+        return jsonify({"reply": reply}), 200
+
+    # --- Existing prompt handling ---
     r = get_rule_reply(body)
     sid = create_session()
     append_session(sid, "user", body, {"from": from_number})
@@ -556,5 +614,7 @@ def twilio_webhook():
     send_twilio_message(from_number, ack)
     return jsonify({"status": "queued", "reply": ack}), 200
 
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), debug=True)
+
