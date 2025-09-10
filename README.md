@@ -23,9 +23,9 @@
 
 ## Architecture
 
-```
+![Flowchart](https://raw.githubusercontent.com/Panchalparth471/whatsapp-bot/main/architecture.png)
 
-```
+
 
 ASCII alternative:
 `WhatsApp User -> Twilio -> Flask App -> Queue -> Worker -> Replicate -> Cloudinary -> Twilio -> User`
