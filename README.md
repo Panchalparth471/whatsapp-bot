@@ -302,46 +302,13 @@ WHATSAPP_MAX_BYTES=16700000
 
 ---
 
-## Tips & recommended improvements
-
-* Move the in-process queue to a persistent job system (Celery / Redis Queue / RQ) for production reliability.
-* Add a small worker pool (set `WORKER_COUNT`) or use separate worker service(s).
-* Record task `processing` state and attempt counts to support retries and crash recovery.
-* Add more granular progress messages (e.g., "Worker started processing your task").
-* Add request-rate limiting and prompt-length caps to prevent abuse.
-* Log Twilio delivery SIDs and optionally handle delivery receipt webhooks.
-
----
-
-## Demo recording checklist (2–3 minutes)
-
-1. Show the Render dashboard with service running and `/health` returning `healthy`.
-2. Show Twilio Sandbox settings with inbound webhook set to `https://whatsapp-bot-kg4m.onrender.com/whatsapp/webhook`.
-3. Demonstrate joining the Twilio sandbox from a WhatsApp account (`join <code>`).
-4. Send a sample prompt from WhatsApp: `A cat playing piano in space`.
-5. Show the bot responding with acknowledgement.
-6. Show the final video arriving in WhatsApp (or show the message with the Cloudinary link).
-7. Demonstrate `/status` and `/history`.
-8. Optionally show server logs of task processing and Cloudinary upload.
-
----
-
-## Submission & how to share the bot with reviewers
-
-**If using Twilio Sandbox**
-
-* Share Twilio Sandbox phone number and join code (from Twilio console). Example message:
-
 > Demo: WhatsApp AI Video Bot
->
-> * Sandbox number: `+1XXXXXXXXXX`
-> * Join code: `join <your-sandbox-code>`
+> You need to verify your number by SMS.
+> * Sandbox number: ` +1 415 523 8886`
+> * Join code: `join low-harder`
 > * Hosted at: `https://whatsapp-bot-kg4m.onrender.com`
->   Steps: Send `join <code>` to the sandbox number in WhatsApp; then message a prompt.
+>   Steps: Send `join low-harder` to the sandbox number in WhatsApp; then message a prompt.
 
-**If using a production Twilio WhatsApp number**
-
-* Share the WhatsApp number (e.g., `+1XXXXXXXX`) and instruct reviewers to message it directly.
 
 ---
 
