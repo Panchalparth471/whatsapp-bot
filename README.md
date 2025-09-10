@@ -33,9 +33,9 @@ Fallback: `Worker -> Local /media/ -> Flask /media/<filename> -> Twilio -> User`
 
 ---
 
-## Quickstart (for your Render deployment)
+## Quickstart (for Render deployment)
 
-Your deployed app is:
+deployed app is:
 
 ```
 https://whatsapp-bot-kg4m.onrender.com
